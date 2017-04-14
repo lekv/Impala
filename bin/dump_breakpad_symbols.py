@@ -198,7 +198,7 @@ def enumerate_pkg_files(pkg, symbol_pkg):
   and yields all tuples thereof. We use a generator here to keep the temporary directory
   and its contents around until the consumer of the generator has finished its processing.
   """
-  IMPALA_BINARY_BASE = os.path.join('usr', 'lib', 'impala')
+  IMPALA_BINARY_BASE = os.path.join('usr', 'lib')
   IMPALA_SYMBOL_BASE = os.path.join('usr', 'lib', 'debug', IMPALA_BINARY_BASE)
   assert_file_exists(pkg)
   assert_file_exists(symbol_pkg)
