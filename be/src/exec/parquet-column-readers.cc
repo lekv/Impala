@@ -24,6 +24,7 @@
 #include <gutil/strings/substitute.h>
 
 #include "exec/hdfs-parquet-scanner.h"
+#include "exec/parquet-column-stats.h"
 #include "exec/parquet-metadata-utils.h"
 #include "exec/parquet-scratch-tuple-batch.h"
 #include "exec/read-write-util.h"
@@ -208,8 +209,8 @@ template<typename T, bool MATERIALIZED>
 class ScalarColumnReader : public BaseScalarColumnReader {
  public:
   ScalarColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
-      const SlotDescriptor* slot_desc)
-    : BaseScalarColumnReader(parent, node, slot_desc),
+      const SlotDescriptor* slot_desc, ColumnStatsContext* col_stats_ctx)
+    : BaseScalarColumnReader(parent, node, slot_desc, col_stats_ctx),
       dict_decoder_init_(false),
       needs_conversion_(false) {
     if (!MATERIALIZED) {
@@ -264,6 +265,32 @@ class ScalarColumnReader : public BaseScalarColumnReader {
 
   virtual bool NeedsConversion() { return NeedsConversionInline(); }
   virtual bool NeedsValidation() { return NeedsValidationInline(); }
+
+  virtual bool SkipValue() override {
+    // NextLevels() should have already been called and def and rep levels should be in
+    // valid range.
+    DCHECK_GE(rep_level_, 0);
+    DCHECK_LE(rep_level_, max_rep_level());
+    DCHECK_GE(def_level_, 0);
+    DCHECK_LE(def_level_, max_def_level());
+    DCHECK_GE(def_level_, def_level_of_immediate_repeated_ancestor()) <<
+      "Caller should have called NextLevels() until we are ready to skip a value";
+
+    // This reader must not be stats constrained, since this method is only called for
+    // readers inside of collections.
+    DCHECK(!IsStatsContrained());
+
+    if (MATERIALIZED) {
+      if (def_level_ >= max_def_level()) {
+        if (page_encoding_ == parquet::Encoding::PLAIN_DICTIONARY) {
+          if (!SkipSlot<true>()) return false;
+        } else {
+          if (!SkipSlot<false>()) return false;
+        }
+      }
+    }
+    return NextLevels<true>();
+  }
 
  protected:
   template<bool IN_COLLECTION>
@@ -362,6 +389,66 @@ class ScalarColumnReader : public BaseScalarColumnReader {
     return continue_execution;
   }
 
+  virtual bool SkipInCurrentPage(int64_t skip_to_value) override {
+    DCHECK_LT(NextValueToRead(), skip_to_value);
+    int64_t num_values = skip_to_value - NextValueToRead();
+    if (max_rep_level() > 0) {
+      return SkipValues<true>(num_values);
+    } else {
+      return SkipValues<false>(num_values);
+    }
+  }
+
+  template<bool IN_COLLECTION>
+  bool SkipValues(int64_t num_values) {
+    DCHECK(MATERIALIZED);
+    // Either we are skipping inside a page and must have enough values to do so, or we
+    // are skipping a single value inside a collection.
+    DCHECK(num_values < num_buffered_values_ || (IN_COLLECTION && num_values == 1));
+    if (UNLIKELY(num_buffered_values_ == 0)) {
+      if (!NextPage()) return parent_->parse_status_.ok();
+    }
+
+    // Repetition level is only present if this column is nested in a collection type.
+    if (!IN_COLLECTION) DCHECK_EQ(max_rep_level(), 0) << slot_desc()->DebugString();
+    if (IN_COLLECTION) DCHECK_GT(max_rep_level(), 0) << slot_desc()->DebugString();
+
+    int64_t val_count = 0;
+    bool continue_execution = true;
+    while (val_count < num_values && !RowGroupAtEnd() && continue_execution) {
+      DCHECK_GT(num_buffered_values_, 0);
+
+      // Fill def/rep level caches if they are empty.
+      int64_t level_batch_size = min(parent_->state_->batch_size(), num_buffered_values_);
+      if (!def_levels_.CacheHasNext()) {
+        parent_->parse_status_.MergeStatus(def_levels_.CacheNextBatch(level_batch_size));
+      }
+      // We only need the repetition levels for populating the position slot since we
+      // are only populating top-level tuples.
+      if (IN_COLLECTION && pos_slot_desc_ != NULL && !rep_levels_.CacheHasNext()) {
+        parent_->parse_status_.MergeStatus(rep_levels_.CacheNextBatch(level_batch_size));
+      }
+      if (UNLIKELY(!parent_->parse_status_.ok())) return false;
+
+      // Read data page and cached levels to materialize values.
+      int64_t cache_start_idx = def_levels_.CacheCurrIdx();
+      int64_t remaining_val_capacity = num_values - val_count;
+      int64_t ret_val_count = 0;
+      if (page_encoding_ == parquet::Encoding::PLAIN_DICTIONARY) {
+        continue_execution = MaterializeAndSkipValueBatch<IN_COLLECTION, true>(
+            remaining_val_capacity, &ret_val_count);
+      } else {
+        continue_execution = MaterializeAndSkipValueBatch<IN_COLLECTION, false>(
+            remaining_val_capacity, &ret_val_count);
+      }
+      val_count += ret_val_count;
+      DCHECK_EQ(ret_val_count, def_levels_.CacheCurrIdx() - cache_start_idx);
+      num_buffered_values_ -= (def_levels_.CacheCurrIdx() - cache_start_idx);
+    }
+    DCHECK_EQ(num_values, val_count);
+    return continue_execution;
+  }
+
   /// Helper function for ReadValueBatch() above that performs value materialization.
   /// It assumes a data page with remaining values is available, and that the def/rep
   /// level caches have been populated.
@@ -414,6 +501,48 @@ class ScalarColumnReader : public BaseScalarColumnReader {
       ++val_count;
     }
     *num_values = val_count;
+    return true;
+  }
+
+  template<bool IN_COLLECTION, bool IS_DICT_ENCODED>
+  bool MaterializeAndSkipValueBatch(int64_t num_values_to_skip,
+      int64_t* num_skipped_values) {
+    DCHECK(MATERIALIZED);
+    DCHECK(pos_slot_desc_ == nullptr);
+
+    // There have to be more values in the page left than we want to skip. Otherwise the
+    // whole page should have been skipped. Unless we're in a collection.
+    DCHECK((num_buffered_values_ > num_values_to_skip) ||
+        (IN_COLLECTION && num_buffered_values_ >= num_values_to_skip));
+    DCHECK(def_levels_.CacheHasNext());
+    if (IN_COLLECTION && pos_slot_desc_ != NULL) DCHECK(rep_levels_.CacheHasNext());
+
+    int val_count = 0;
+    while (def_levels_.CacheHasNext()) {
+      int def_level = def_levels_.CacheGetNext();
+
+      if (IN_COLLECTION) {
+        if (def_level < def_level_of_immediate_repeated_ancestor()) {
+          // A containing repeated field is empty or NULL. Skip the value but
+          // move to the next repetition level if necessary.
+          if (pos_slot_desc_ != NULL) rep_levels_.CacheGetNext();
+          continue;
+        }
+        if (pos_slot_desc_ != NULL) {
+          int rep_level = rep_levels_.CacheGetNext();
+          // Reset position counter if we are at the start of a new parent collection.
+          if (rep_level <= max_rep_level() - 1) pos_current_value_ = 0;
+        }
+      }
+
+      if (def_level >= max_def_level()) {
+        bool continue_execution = SkipSlot<IS_DICT_ENCODED>();
+        if (UNLIKELY(!continue_execution)) return false;
+      }
+      ++val_count;
+      if (UNLIKELY(val_count == num_values_to_skip)) break;
+    }
+    *num_skipped_values = val_count;
     return true;
   }
 
@@ -500,6 +629,30 @@ class ScalarColumnReader : public BaseScalarColumnReader {
     if (UNLIKELY(NeedsConversionInline() && !tuple->IsNull(null_indicator_offset_)
             && !ConvertSlot(val_ptr, slot, pool))) {
       return false;
+    }
+    return true;
+  }
+
+  template<bool IS_DICT_ENCODED>
+  inline bool SkipSlot() {
+    // TODO: Add skip method to plain decoder and dictionary
+    T val;
+    T* val_ptr = &val;
+    if (IS_DICT_ENCODED) {
+      DCHECK_EQ(page_encoding_, parquet::Encoding::PLAIN_DICTIONARY);
+      if (UNLIKELY(!dict_decoder_.GetNextValue(val_ptr))) {
+        SetDictDecodeError();
+        return false;
+      }
+    } else {
+      DCHECK_EQ(page_encoding_, parquet::Encoding::PLAIN);
+      int encoded_len =
+          ParquetPlainEncoder::Decode<T>(data_, data_end_, fixed_len_size_, val_ptr);
+      if (UNLIKELY(encoded_len < 0)) {
+        SetPlainDecodeError();
+        return false;
+      }
+      data_ += encoded_len;
     }
     return true;
   }
@@ -615,8 +768,8 @@ bool ScalarColumnReader<TimestampValue, true>::ValidateSlot(
 class BoolColumnReader : public BaseScalarColumnReader {
  public:
   BoolColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
-      const SlotDescriptor* slot_desc)
-    : BaseScalarColumnReader(parent, node, slot_desc) {
+      const SlotDescriptor* slot_desc, ColumnStatsContext* col_stats_ctx)
+    : BaseScalarColumnReader(parent, node, slot_desc, col_stats_ctx) {
     if (slot_desc_ != NULL) DCHECK_EQ(slot_desc_->type().type, TYPE_BOOLEAN);
   }
 
@@ -630,7 +783,29 @@ class BoolColumnReader : public BaseScalarColumnReader {
     return ReadValue<false>(pool, tuple);
   }
 
+  int64_t NextValueToRead() {
+    // Subtract 1 to account for the NextLevels() call to seed the column reader.
+    return num_values_read_ - (num_buffered_values_ > 0 ? num_buffered_values_ + 1 : 0);
+  }
+
+  virtual bool SkipValue() override {
+    // This reader must not be stats constrained, since this method is only called for
+    // readers inside of collections.
+    DCHECK(!IsStatsContrained());
+    return SkipValues<true>(1);
+  }
+
  protected:
+  virtual bool SkipInCurrentPage(int64_t skip_to_value) override {
+    DCHECK_LT(NextValueToRead(), skip_to_value);
+    int64_t num_values = skip_to_value - NextValueToRead();
+    if (max_rep_level() > 0) {
+      return SkipValues<true>(num_values);
+    } else {
+      return SkipValues<false>(num_values);
+    }
+  }
+
   virtual Status CreateDictionaryDecoder(uint8_t* values, int size,
       DictDecoderBase** decoder) {
     DCHECK(false) << "Dictionary encoding is not supported for bools. Should never "
@@ -682,6 +857,42 @@ class BoolColumnReader : public BaseScalarColumnReader {
   inline bool ReadSlot(Tuple* tuple, MemPool* pool)  {
     void* slot = tuple->GetSlot(tuple_offset_);
     if (!bool_values_.GetValue(1, reinterpret_cast<bool*>(slot))) {
+      parent_->parse_status_ = Status("Invalid bool column.");
+      return false;
+    }
+    return NextLevels<IN_COLLECTION>();
+  }
+
+  template<bool IN_COLLECTION>
+  inline bool SkipValues(int64_t num_values) {
+    // TODO: Make this more efficient
+    DCHECK(slot_desc_ != NULL);
+    // Def and rep levels should be in valid range.
+    DCHECK_GE(rep_level_, 0);
+    DCHECK_LE(rep_level_, max_rep_level());
+    DCHECK_GE(def_level_, 0);
+    DCHECK_LE(def_level_, max_def_level());
+    DCHECK_GE(def_level_, def_level_of_immediate_repeated_ancestor()) <<
+        "Caller should have called NextLevels() until we are ready to read a value";
+
+    bool continue_execution = true;
+    int64_t val_count = 0;
+    while (val_count < num_values && !RowGroupAtEnd() && continue_execution) {
+      if (def_level_ >= max_def_level()) {
+        continue_execution &= SkipSlot<IN_COLLECTION>();
+      } else {
+        // Null value
+        continue_execution &= NextLevels<IN_COLLECTION>();
+      }
+      ++val_count;
+    }
+    return continue_execution;
+  }
+
+  template<bool IN_COLLECTION>
+  inline bool SkipSlot() {
+    bool dummy;
+    if (!bool_values_.GetValue(1, &dummy)) {
       parent_->parse_status_ = Status("Invalid bool column.");
       return false;
     }
@@ -765,6 +976,36 @@ static bool RequiresSkippedDictionaryHeaderCheck(
   return v.VersionEq(1,1,0) || (v.VersionEq(1,2,0) && v.is_impala_internal);
 }
 
+int64_t BaseScalarColumnReader::NextValueToRead() {
+  return num_values_read_ - num_buffered_values_;
+}
+
+bool BaseScalarColumnReader::SkipToValue(int64_t skip_to_value, int64_t* skipped_to_value,
+    int64_t* num_remaining_in_page) {
+  DCHECK(skipped_to_value != nullptr);
+  DCHECK_GE(skip_to_value, NextValueToRead());
+  if (skip_to_value >= num_values_read_) {
+    parent_->parse_status_ = ReadDataPage(skip_to_value);
+    *skipped_to_value = NextValueToRead();
+    if (UNLIKELY(!parent_->parse_status_.ok())) return false;
+  }
+  *skipped_to_value = NextValueToRead();
+  *num_remaining_in_page = num_values_read_ - *skipped_to_value;
+
+  // Exhausted read
+  if (num_buffered_values_ == 0) {
+    rep_level_ = HdfsParquetScanner::ROW_GROUP_END;
+    def_level_ = HdfsParquetScanner::INVALID_LEVEL;
+    pos_current_value_ = HdfsParquetScanner::INVALID_POS;
+    return false;
+  }
+
+  if (skip_to_value <= *skipped_to_value) return true;
+
+  *skipped_to_value = skip_to_value;
+  return SkipInCurrentPage(skip_to_value);
+}
+
 Status BaseScalarColumnReader::ReadPageHeader(bool peek,
     parquet::PageHeader* next_page_header, uint32_t* next_header_size, bool* eos) {
   *eos = false;
@@ -776,10 +1017,11 @@ Status BaseScalarColumnReader::ReadPageHeader(bool peek,
   if (buffer_size == 0) {
     // The data pages contain fewer values than stated in the column metadata.
     DCHECK(stream_->eosr());
+    DCHECK_EQ(0, num_buffered_values_);
     DCHECK_LT(num_values_read_, metadata_->num_values);
     // TODO for 2.3: node_.element->name isn't necessarily useful
-    ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID,
-                 metadata_->num_values, num_values_read_, node_.element->name, filename());
+    ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID, metadata_->num_values,
+        num_values_read_, node_.element->name, filename());
     RETURN_IF_ERROR(parent_->state_->LogOrReturnError(msg));
     *eos = true;
     return Status::OK();
@@ -947,7 +1189,7 @@ Status BaseScalarColumnReader::InitDictionary() {
   return Status::OK();
 }
 
-Status BaseScalarColumnReader::ReadDataPage() {
+Status BaseScalarColumnReader::ReadDataPage(int64_t skip_to_value) {
   // We're about to move to the next data page.  The previous data page is
   // now complete, free up any memory allocated for it. If the data page contained
   // strings we need to attach it to the returned batch.
@@ -958,18 +1200,25 @@ Status BaseScalarColumnReader::ReadDataPage() {
     decompressed_data_pool_->FreeAll();
   }
 
-  // Read the next data page, skipping page types we don't care about.
-  // We break out of this loop on the non-error case (a data page was found or we read all
-  // the pages).
+  if (skip_to_value >= num_values_read_) {
+    // This will skip the rest of the current page, too
+    num_buffered_values_ = 0;
+  }
+
+  // Read the next data page, skipping page types we don't care about. This will also
+  // discard any values left in the current page, for example when another column reader
+  // skipped a page and the current one catches up. We break out of this loop on the
+  // non-error case (a data page was found or we read all the pages).
   while (true) {
+    // Either we're skipping values or we're at the end of a page
     DCHECK_EQ(num_buffered_values_, 0);
     if (num_values_read_ == metadata_->num_values) {
       // No more pages to read
       // TODO: should we check for stream_->eosr()?
       break;
     } else if (num_values_read_ > metadata_->num_values) {
-      ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID,
-          metadata_->num_values, num_values_read_, node_.element->name, filename());
+      ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID, metadata_->num_values,
+          num_values_read_ , node_.element->name, filename());
       RETURN_IF_ERROR(parent_->state_->LogOrReturnError(msg));
       return Status::OK();
     }
@@ -1004,12 +1253,64 @@ Status BaseScalarColumnReader::ReadDataPage() {
       continue;
     }
 
+    DCHECK(current_page_header_.__isset.data_page_header);
+
+    bool skip_page = false;
+
+    // Check whether we need to skip the whole page?
+    int num_values = current_page_header_.data_page_header.num_values;
+    if (skip_to_value > num_values_read_ + num_values) skip_page = true;
+
+    // Evaluate page statistics
+    if (!skip_page && col_stats_ctx_ != nullptr &&
+        current_page_header_.data_page_header.__isset.statistics) {
+      const parquet::Statistics& stats = current_page_header_.data_page_header.statistics;
+      ScalarExprEvaluator* evals[2];
+      int num_evals = 0;
+      if (col_stats_ctx_->min_desc != nullptr) {
+        SlotDescriptor* slot_desc = col_stats_ctx_->min_desc;
+        void* slot = col_stats_ctx_->tuple->GetSlot(slot_desc->tuple_offset());
+        ScalarExprEvaluator* eval = col_stats_ctx_->min_eval;
+        DCHECK(eval != nullptr);
+        if (ColumnStatsBase::ReadFromThrift(stats, slot_desc->type(),
+              col_stats_ctx_->col_order, ColumnStatsBase::StatsField::MIN, slot)) {
+          evals[num_evals++] = eval;
+        }
+      }
+
+      if (col_stats_ctx_->max_desc != nullptr) {
+        SlotDescriptor* slot_desc = col_stats_ctx_->max_desc;
+        void* slot = col_stats_ctx_->tuple->GetSlot(slot_desc->tuple_offset());
+        ScalarExprEvaluator* eval = col_stats_ctx_->max_eval;
+        DCHECK(evals != nullptr);
+        if (ColumnStatsBase::ReadFromThrift(stats, slot_desc->type(),
+              col_stats_ctx_->col_order, ColumnStatsBase::StatsField::MAX, slot)) {
+          evals[num_evals++] = eval;
+        }
+      }
+
+      if (num_evals > 0) {
+        TupleRow row;
+        row.SetTuple(0, col_stats_ctx_->tuple);
+        if (!ExecNode::EvalConjuncts(evals, num_evals, &row)) skip_page = true;
+      }
+    }
+
+
+    if (skip_page) {
+      if (!stream_->SkipBytes(data_size, &status)) return status;
+      if (num_values < 0) {
+        return Status(Substitute("Error reading data page in Parquet file '$0'. "
+              "Invalid number of values in metadata: $1", filename(), num_values));
+      }
+      num_values_read_ += num_values;
+      COUNTER_ADD(parent_->num_stats_filtered_pages_counter_, 1);
+      continue;
+    }
+
     // Read Data Page
-    // TODO: when we start using page statistics, we will need to ignore certain corrupt
-    // statistics. See IMPALA-2208 and PARQUET-251.
     if (!stream_->ReadBytes(data_size, &data_, &status)) return status;
     data_end_ = data_ + data_size;
-    int num_values = current_page_header_.data_page_header.num_values;
     if (num_values < 0) {
       return Status(Substitute("Error reading data page in Parquet file '$0'. "
           "Invalid number of values in metadata: $1", filename(), num_values));
@@ -1078,6 +1379,7 @@ bool BaseScalarColumnReader::NextLevels() {
   if (UNLIKELY(num_buffered_values_ == 0)) {
     if (!NextPage()) return parent_->parse_status_.ok();
   }
+
   --num_buffered_values_;
 
   // Definition level is not present if column and any containing structs are required.
@@ -1124,8 +1426,34 @@ bool CollectionColumnReader::NextLevels() {
       if (!children_[c]->NextLevels()) return false;
     } while (children_[c]->rep_level() > new_collection_rep_level());
   }
+  ++next_value_to_read_;
   UpdateDerivedState();
   return true;
+}
+
+bool CollectionColumnReader::SkipToValue(int64_t skip_to_value, int64_t* skipped_to_value,
+    int64_t* num_remaining_in_page) {
+  *num_remaining_in_page = std::numeric_limits<int64_t>::max();
+  int64_t num_to_skip = skip_to_value - NextValueToRead();
+  DCHECK_GE(num_to_skip, 0);
+  // num_to_skip is zero if the parquet scanner wants to figure out whether pages can be
+  // skipped based on statistics in the root columns.
+  if (num_to_skip == 0) return true;
+
+  int val_count = 0;
+  bool continue_execution = true;
+  while (val_count < num_to_skip && !RowGroupAtEnd() && continue_execution) {
+    if (def_level_ < def_level_of_immediate_repeated_ancestor()) {
+      // A containing repeated field is empty or NULL
+      continue_execution = NextLevels();
+      continue;
+    }
+    continue_execution = SkipValue();
+    ++val_count;
+  }
+  DCHECK_EQ(val_count, num_to_skip);
+  *skipped_to_value = NextValueToRead();
+  return continue_execution;
 }
 
 bool CollectionColumnReader::ReadValue(MemPool* pool, Tuple* tuple) {
@@ -1165,8 +1493,80 @@ bool CollectionColumnReader::ReadSlot(Tuple* tuple, MemPool* pool) {
   if (!continue_execution) return false;
 
   // AssembleCollection() advances child readers, so we don't need to call NextLevels()
+  ++next_value_to_read_;
   UpdateDerivedState();
   return true;
+}
+
+bool CollectionColumnReader::SkipValue() {
+  DCHECK_GE(rep_level_, 0);
+  DCHECK_GE(def_level_, 0);
+  DCHECK_GE(def_level_, def_level_of_immediate_repeated_ancestor()) <<
+      "Caller should have called NextLevels() until we are ready to read a value";
+
+  if (tuple_offset_ == -1) {
+    return CollectionColumnReader::NextLevels();
+  } else if (def_level_ >= max_def_level()) {
+    return SkipSlot();
+  } else {
+    return CollectionColumnReader::NextLevels();
+  }
+}
+
+bool CollectionColumnReader::SkipSlot() {
+  DCHECK(!children_.empty());
+  DCHECK_LE(rep_level_, new_collection_rep_level());
+
+  bool continue_execution = !parent_->scan_node_->ReachedLimit() && !parent_->context_->cancelled();
+  bool end_of_collection = children_[0]->rep_level() == -1;
+
+  while (!end_of_collection && continue_execution) {
+    // 'num_rows' can be very high if we're writing to a large CollectionValue. Limit
+    // the number of rows we read at one time so we don't spend too long in the
+    // 'num_rows' loop below before checking for cancellation or limit reached.
+    int64_t num_rows = static_cast<int64_t>(
+        parent_->scan_node_->runtime_state()->batch_size());
+
+    for (int64_t row_idx = 0; row_idx < num_rows && !end_of_collection; ++row_idx) {
+      DCHECK(continue_execution);
+      // A tuple is produced iff the collection that contains its values is not empty and
+      // non-NULL. (Empty or NULL collections produce no output values, whereas NULL is
+      // output for the fields of NULL structs.)
+      bool materialize_tuple = children_[0]->def_level() >=
+          children_[0]->def_level_of_immediate_repeated_ancestor();
+      continue_execution =
+          SkipCollectionItem(materialize_tuple);
+      if (UNLIKELY(!continue_execution)) break;
+      end_of_collection = children_[0]->rep_level() <= new_collection_rep_level();
+    }
+
+    continue_execution &= !parent_->context_->cancelled();
+  }
+  if (!continue_execution) return false;
+
+  // SkipCollectionItem() advances child readers, so we don't need to call NextLevels()
+  ++next_value_to_read_;
+  UpdateDerivedState();
+  return true;
+}
+
+bool CollectionColumnReader::SkipCollectionItem(bool materialize_tuple) {
+  bool continue_execution = true;
+  for (ParquetColumnReader* col_reader : children_) {
+    if (materialize_tuple) {
+      // All column readers for this tuple should a value to materialize.
+      FILE_CHECK_GE(col_reader->def_level(),
+                    col_reader->def_level_of_immediate_repeated_ancestor());
+      continue_execution = col_reader->SkipValue();
+    } else {
+      // A containing repeated field is empty or NULL
+      FILE_CHECK_LT(col_reader->def_level(),
+                    col_reader->def_level_of_immediate_repeated_ancestor());
+      continue_execution = col_reader->NextLevels();
+    }
+    if (UNLIKELY(!continue_execution)) break;
+  }
+  return continue_execution;
 }
 
 void CollectionColumnReader::UpdateDerivedState() {
@@ -1199,7 +1599,10 @@ void CollectionColumnReader::UpdateDerivedState() {
 }
 
 ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
-    bool is_collection_field, const SlotDescriptor* slot_desc, HdfsParquetScanner* parent) {
+    bool is_collection_field, const SlotDescriptor* slot_desc, HdfsParquetScanner* parent,
+    ColumnStatsContext* col_stats_ctx) {
+  // Column statistics are not supported on collections.
+  DCHECK(!is_collection_field || col_stats_ctx == nullptr);
   ParquetColumnReader* reader = NULL;
   if (is_collection_field) {
     // Create collection reader (note this handles both NULL and non-NULL 'slot_desc')
@@ -1208,47 +1611,55 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
     // Create the appropriate ScalarColumnReader type to read values into 'slot_desc'
     switch (slot_desc->type().type) {
       case TYPE_BOOLEAN:
-        reader = new BoolColumnReader(parent, node, slot_desc);
+        reader = new BoolColumnReader(parent, node, slot_desc, col_stats_ctx);
         break;
       case TYPE_TINYINT:
-        reader = new ScalarColumnReader<int8_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int8_t, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_SMALLINT:
-        reader = new ScalarColumnReader<int16_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int16_t, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_INT:
-        reader = new ScalarColumnReader<int32_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int32_t, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_BIGINT:
-        reader = new ScalarColumnReader<int64_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int64_t, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_FLOAT:
-        reader = new ScalarColumnReader<float, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<float, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_DOUBLE:
-        reader = new ScalarColumnReader<double, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<double, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_TIMESTAMP:
-        reader = new ScalarColumnReader<TimestampValue, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<TimestampValue, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_STRING:
       case TYPE_VARCHAR:
       case TYPE_CHAR:
-        reader = new ScalarColumnReader<StringValue, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<StringValue, true>(parent, node, slot_desc,
+            col_stats_ctx);
         break;
       case TYPE_DECIMAL:
         switch (slot_desc->type().GetByteSize()) {
           case 4:
             reader = new ScalarColumnReader<Decimal4Value, true>(
-                parent, node, slot_desc);
+                parent, node, slot_desc, col_stats_ctx);
             break;
           case 8:
             reader = new ScalarColumnReader<Decimal8Value, true>(
-                parent, node, slot_desc);
+                parent, node, slot_desc, col_stats_ctx);
             break;
           case 16:
             reader = new ScalarColumnReader<Decimal16Value, true>(
-                parent, node, slot_desc);
+                parent, node, slot_desc, col_stats_ctx);
             break;
         }
         break;
@@ -1259,7 +1670,7 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
     // Special case for counting scalar values (e.g. count(*), no materialized columns in
     // the file, only materializing a position slot). We won't actually read any values,
     // only the rep and def levels, so it doesn't matter what kind of reader we make.
-    reader = new ScalarColumnReader<int8_t, false>(parent, node, slot_desc);
+    reader = new ScalarColumnReader<int8_t, false>(parent, node, slot_desc, nullptr);
   }
   return parent->obj_pool_.Add(reader);
 }

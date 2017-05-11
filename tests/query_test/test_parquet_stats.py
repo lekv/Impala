@@ -17,12 +17,16 @@
 
 import os
 import pytest
+import random
 import shlex
 from subprocess import check_call
 
 from tests.common.test_vector import ImpalaTestDimension
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.util.filesystem_utils import get_fs_path
+from tests.common.test_result_verifier import (
+  verify_query_result_is_equal,
+  create_query_result)
 
 MT_DOP_VALUES = [0, 1, 2, 8]
 
@@ -38,7 +42,8 @@ class TestParquetStats(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestParquetStats, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('mt_dop', *MT_DOP_VALUES))
+    # TODO: re-enable
+    # cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('mt_dop', *MT_DOP_VALUES))
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format == 'parquet')
 
@@ -69,3 +74,62 @@ class TestParquetStats(ImpalaTestSuite):
     # skipped inside a fragment, so we ensure that the tests run in a single fragment.
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/parquet-deprecated-stats', vector, unique_database)
+
+  def test_page_stats_smoke(self, vector):
+    """Make sure that these don't crash."""
+    queries = [
+      """SELECT c_custkey, c_orders.o_orderkey, count(*) FROM
+      tpch_nested_parquet.customer, customer.c_orders c_orders, c_orders.o_lineitems GROUP
+      BY c_custkey, c_orders.o_orderkey LIMIT 5;""",
+      # Tests selecting from bool columns.
+      """select * from functional_parquet.alltypessmall;""",
+      # Tests skipping bool columns
+      """select count(*) from default.parquet_ibs where bool_col = false and id <
+      500000;""",
+      """select id, ar.item from i5185.s, s.a ar where id = 131073 limit 8;""",
+      """select a.tinyint_col, b.id, a.string_col
+      from functional_parquet.alltypesagg a cross join functional_parquet.alltypessmall b
+      where a.tinyint_col = b.id
+      and a.month=1
+      and a.day=1
+      and b.bool_col = false;""",
+      """select a.tinyint_col, b.id, a.string_col
+      from functional_parquet.alltypesagg a cross join functional_parquet.alltypessmall b
+      where a.tinyint_col = b.id
+      and a.month=1
+      and a.day=1
+      and a.tinyint_col + b.tinyint_col < 5
+      and a.string_col > '88'
+      and b.bool_col = false;"""
+    ]
+    map(self.execute_query, queries)
+
+  def test_compare_queries(self, vector, unique_database):
+    reference_table = "tpch.lineitem"
+    test_table = "%s.lineitem" % unique_database
+    test_table = "default.l"
+
+    # Create test table
+    # self.client.execute('create table %s sort by (l_suppkey, l_orderkey) stored as '
+    #                     'parquet as select * from tpch.lineitem' % test_table)
+
+    # Hardcoded parameters that triggered corner cases during development.
+    params = [
+      ('=', 5000, '<', 10000),
+      ('=', 7993, '=', 6242),
+    ]
+    query_tmpl = """select * from {0} where l_suppkey {1} {2} and l_orderkey {3} {4} order
+        by l_orderkey, l_linenumber limit 100;"""
+
+    random.seed(123)
+    # generate random queries
+    pred = lambda: random.choice("<=>")
+    for i in xrange(200):
+      params.append(
+          [pred(), random.randint(1, 10000), pred(), random.randint(1, 6000000)])
+
+    for p in params:
+      expected = create_query_result(
+          self.execute_query(query_tmpl.format(reference_table, *p)))
+      actual = create_query_result(self.execute_query(query_tmpl.format(test_table, *p)))
+      verify_query_result_is_equal(actual, expected)

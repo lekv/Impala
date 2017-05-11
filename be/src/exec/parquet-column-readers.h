@@ -121,6 +121,8 @@ class ParquetLevelDecoder : public RleDecoder {
 /// ReadValue(). Can also write position slots.
 class ParquetColumnReader {
  public:
+  using ColumnStatsContext = HdfsParquetScanner::ColumnStatsContext;
+
   /// Creates a column reader for 'node' and associates it with the given parent scanner.
   /// Adds the new column reader to the parent's object pool.
   /// 'slot_desc' may be NULL, in which case the returned column reader can only be used
@@ -131,9 +133,11 @@ class ParquetColumnReader {
   /// 'is_collection_field' should be true if the reader reads one value per array, and
   /// false if it reads one value per item).  The reader is added to the runtime state's
   /// object pool. Does not create child readers for collection readers; these must be
-  /// added by the caller.
+  /// added by the caller.  If 'col_stats_ctx' is not nullptr, it will be used to skip
+  /// pages based on page statistics.
   static ParquetColumnReader* Create(const SchemaNode& node, bool is_collection_field,
-      const SlotDescriptor* slot_desc, HdfsParquetScanner* parent);
+      const SlotDescriptor* slot_desc, HdfsParquetScanner* parent,
+      ColumnStatsContext* col_stats_ctx);
 
   virtual ~ParquetColumnReader() { }
 
@@ -224,6 +228,28 @@ class ParquetColumnReader {
   /// 'tuple') and increments pos_current_value_.
   void ReadPosition(Tuple* tuple);
 
+  // Return the next value offset that will be read.
+  virtual int64_t NextValueToRead() = 0;
+
+  // Return whether the current reader has a constraint on Parquet statistics that would
+  // allow it to skip pages.
+  virtual bool IsStatsContrained() { return false; }
+
+  /// Skip at least to 'skip_to_value'. May skip more rows if the Parquet page statistics
+  /// deem it safe to do so. If not nullptr, 'skipped_to_value' will be set to the row
+  /// that the reader advanced to. If not nullptr, 'num_remaining_in_page' will be set to
+  /// the number of rows that can be read before this reader reaches the end of its
+  /// current page, or to int64_t::max() if the reader does not read from pages.
+  /// set. Must be called with skip_to_value >= NextValueToRead(). Must not be called if
+  /// SkipValue() has been called already.
+  virtual bool SkipToValue(int64_t skip_to_value, int64_t* skipped_to_value,
+      int64_t* num_remaining_in_page) = 0;
+
+  /// Skip a single value in the reader. This method will only advance by a single value,
+  /// reading new pages if necessary. Must not be called if SkipToValue() has been called
+  /// already.
+  virtual bool SkipValue() = 0;
+
   /// Returns true if this column reader has reached the end of the row group.
   inline bool RowGroupAtEnd() { return rep_level_ == HdfsParquetScanner::ROW_GROUP_END; }
 
@@ -249,8 +275,8 @@ class ParquetColumnReader {
   /// The current repetition and definition levels of this reader. Advanced via
   /// ReadValue() and NextLevels(). Set to -1 when this column reader does not have a
   /// current rep and def level (i.e. before the first NextLevels() call or after the last
-  /// value in the column has been read). If this is not inside a collection, rep_level_ is
-  /// always 0.
+  /// value in the column has been read). If this is not inside a collection, rep_level_
+  /// is always 0.
   /// int16_t is large enough to hold the valid levels 0-255 and sentinel value -1.
   /// The maximum values are cached here because they are accessed in inner loops.
   int16_t rep_level_;
@@ -304,7 +330,7 @@ class ParquetColumnReader {
 class BaseScalarColumnReader : public ParquetColumnReader {
  public:
   BaseScalarColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
-      const SlotDescriptor* slot_desc)
+      const SlotDescriptor* slot_desc, ColumnStatsContext* col_stats_ctx)
     : ParquetColumnReader(parent, node, slot_desc),
       data_(NULL),
       data_end_(NULL),
@@ -313,6 +339,7 @@ class BaseScalarColumnReader : public ParquetColumnReader {
       page_encoding_(parquet::Encoding::PLAIN_DICTIONARY),
       num_buffered_values_(0),
       num_values_read_(0),
+      col_stats_ctx_(col_stats_ctx),
       metadata_(NULL),
       stream_(NULL),
       decompressed_data_pool_(new MemPool(parent->scan_node_->mem_tracker())) {
@@ -383,9 +410,12 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   // need to be validated when read from disk.
   virtual bool NeedsValidation() { return false; }
 
-  // TODO: Some encodings might benefit a lot from a SkipValues(int num_rows) if
-  // we know this row can be skipped. This could be very useful with stats and big
-  // sections can be skipped. Implement that when we can benefit from it.
+  virtual int64_t NextValueToRead() override;
+
+  virtual bool IsStatsContrained() override { return col_stats_ctx_ != nullptr; }
+
+  virtual bool SkipToValue(int64_t skip_to_value, int64_t* skipped_to_value,
+      int64_t* num_remaining_in_page) override;
 
  protected:
   // Friend parent scanner so it can perform validation (e.g. ValidateEndOfRowGroup())
@@ -418,6 +448,9 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   /// The number of values seen so far. Updated per data page.
   int64_t num_values_read_;
 
+  /// The ColumnStatsContext used by this column reader to evaluate Parquet statistics.
+  ColumnStatsContext* col_stats_ctx_;
+
   const parquet::ColumnMetaData* metadata_;
   boost::scoped_ptr<Codec> decompressor_;
   ScannerContext::Stream* stream_;
@@ -437,16 +470,19 @@ class BaseScalarColumnReader : public ParquetColumnReader {
       uint32_t* next_header_size, bool* eos);
 
   /// Read the next data page. If a dictionary page is encountered, that will be read and
-  /// this function will continue reading the next data page.
-  Status ReadDataPage();
+  /// this function will continue reading the next data page. If 'col_stats_ctx_' !=
+  /// nullptr, it will be used to skip pages based on their Parquet statistics. If
+  /// 'skip_to_value' is > 0, then all pages up to that number of values will be skipped.
+  Status ReadDataPage(int64_t skip_to_value = 0);
 
-  /// Try to move the the next page and buffer more values. Return false and sets rep_level_,
-  /// def_level_ and pos_current_value_ to -1 if no more pages or an error encountered.
+  /// Try to move to the next page and buffer more values. Return false and sets
+  /// rep_level_, def_level_ and pos_current_value_ to -1 if no more pages or an error
+  /// encountered.
   bool NextPage();
 
   /// Implementation for NextLevels().
   template <bool ADVANCE_REP_LEVEL>
-  bool NextLevels();
+    bool NextLevels();
 
   /// Creates a dictionary decoder from values/size. 'decoder' is set to point to a
   /// dictionary decoder stored in this object. Subclass must implement this. Returns
@@ -475,6 +511,10 @@ class BaseScalarColumnReader : public ParquetColumnReader {
     return page_encoding_ != parquet::Encoding::PLAIN_DICTIONARY
         && slot_desc_ != nullptr && slot_desc_->type().IsStringType();
   }
+
+  /// Skip values within the current page until reaching value 'skip_to_value' in the
+  /// column.
+  virtual bool SkipInCurrentPage(int64_t skip_to_value) = 0;
 };
 
 /// Collections are not materialized directly in parquet files; only scalar values appear
@@ -484,7 +524,7 @@ class CollectionColumnReader : public ParquetColumnReader {
  public:
   CollectionColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
       const SlotDescriptor* slot_desc)
-    : ParquetColumnReader(parent, node, slot_desc) {
+    : ParquetColumnReader(parent, node, slot_desc), next_value_to_read_(-1) {
     DCHECK(node_.is_repeated());
     if (slot_desc != NULL) DCHECK(slot_desc->type().IsCollectionType());
   }
@@ -512,11 +552,19 @@ class CollectionColumnReader : public ParquetColumnReader {
   /// reader's state.
   virtual bool NextLevels();
 
+  virtual int64_t NextValueToRead() { return next_value_to_read_; }
+
+  virtual bool SkipToValue(int64_t skip_to_value, int64_t* skipped_to_value,
+      int64_t* num_remaining_in_page) override;
+
+  virtual bool SkipValue() override;
+
   /// This is called once for each row group in the file.
   void Reset() {
     def_level_ = -1;
     rep_level_ = -1;
     pos_current_value_ = -1;
+    next_value_to_read_ = -1;
   }
 
   virtual void Close(RowBatch* row_batch) {
@@ -532,6 +580,9 @@ class CollectionColumnReader : public ParquetColumnReader {
   /// any slot and is only used by this reader to read def and rep levels.
   vector<ParquetColumnReader*> children_;
 
+  /// The next value that will be read from this reader.
+  int64_t next_value_to_read_;
+
   /// Updates this reader's def_level_, rep_level_, and pos_current_value_ based on child
   /// reader's state.
   void UpdateDerivedState();
@@ -544,6 +595,15 @@ class CollectionColumnReader : public ParquetColumnReader {
   /// set, the query is cancelled, or the scan node limit was reached. Otherwise returns
   /// true.
   inline bool ReadSlot(Tuple* tuple, MemPool* pool);
+
+  /// Skip a single materialized value of the parent collections. Return false if
+  /// execution should be aborted, otherwise returns true.
+  bool SkipSlot();
+
+  /// Skip a single materialized item inside the current collection. This will advance all
+  /// child readers by 1. Return false if execution should be aborted, otherwise returns
+  /// true.
+  bool SkipCollectionItem(bool materialize_tuple);
 };
 
 }

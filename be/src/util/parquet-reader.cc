@@ -247,8 +247,8 @@ int main(int argc, char** argv) {
     column_num_rows.resize(rg.columns.size());
 
     for (int c = 0; c < rg.columns.size(); ++c) {
-      cerr << "  Reading column " << c << endl;
       ColumnChunk& col = rg.columns[c];
+      cerr << "  Reading column " << c << " (Type: " << col.meta_data.type << ")" << endl;
 
       int first_page_offset = col.meta_data.data_page_offset;
       if (col.meta_data.__isset.dictionary_page_offset) {
@@ -280,10 +280,9 @@ int main(int argc, char** argv) {
         data += header.compressed_page_size;
         ++pages_read;
       }
+      cout << "  Pages read: " << pages_read << endl;
       // Check that we ended exactly where we should have.
       assert(data == col_end);
-      // Check that all cols have the same number of rows.
-      assert(column_num_rows[0] == column_num_rows[c]);
     }
     num_rows += column_num_rows[0];
   }

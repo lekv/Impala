@@ -69,9 +69,8 @@ class ColumnStatsBase {
   /// 'stats_field' into the buffer pointed to by 'slot', based on 'col_type'. Returns
   /// true if reading statistics for columns of type 'col_type' is supported and decoding
   /// was successful, false otherwise.
-  static bool ReadFromThrift(const parquet::ColumnChunk& col_chunk,
-      const ColumnType& col_type, const parquet::ColumnOrder* col_order,
-      StatsField stats_field, void* slot);
+  static bool ReadFromThrift(const parquet::Statistics& stats, const ColumnType& col_type,
+      const parquet::ColumnOrder* col_order, StatsField stats_field, void* slot);
 
   /// Merges this statistics object with values from 'other'. If other has not been
   /// initialized, then this object will not be changed.

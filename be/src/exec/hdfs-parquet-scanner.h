@@ -377,12 +377,26 @@ class HdfsParquetScanner : public HdfsScanner {
 
   boost::scoped_ptr<ParquetSchemaResolver> schema_resolver_;
 
+  /// Column readers that have a non-null ColumnStatsContext, which means they have a
+  /// predicate on the column that can be evaluated against page and row-group statistics.
+  /// Elements point to elements of column_readers_.
+  std::vector<ParquetColumnReader*> stats_constrained_readers_;
+
+  /// Column readers that have a null ColumnStatsContext.
+  /// Elements point to elements of column_readers_.
+  std::vector<ParquetColumnReader*> non_stats_constrained_readers_;
+
   /// Buffer to back tuples when reading parquet::Statistics.
   ScopedBuffer min_max_tuple_buffer_;
 
   /// Clone of Min/max statistics conjunct evaluators. Has the same life time as
   /// the scanner. Stored in 'obj_pool_'.
   vector<ScalarExprEvaluator*> min_max_conjunct_evals_;
+
+  /// Skip the file based on its stats. This is set in BuildColumnStatsContexts() to
+  /// signal that the file can be completely skipped based on stats, for example when
+  /// fields with a predicate cannot be resolved.
+  bool skip_file_on_stats_;
 
   /// Cached runtime filter contexts, one for each filter that applies to this column,
   /// owned by instances of this class.
@@ -467,6 +481,9 @@ class HdfsParquetScanner : public HdfsScanner {
   /// Number of row groups that need to be read.
   RuntimeProfile::Counter* num_row_groups_counter_;
 
+  /// Number of pages that are skipped because of Parquet page statistics.
+  RuntimeProfile::Counter* num_stats_filtered_pages_counter_;
+
   /// Number of scanners that end up doing no reads because their splits don't overlap
   /// with the midpoint of any row-group in the file.
   RuntimeProfile::Counter* num_scanners_with_no_reads_counter_;
@@ -481,6 +498,38 @@ class HdfsParquetScanner : public HdfsScanner {
   const char* filename() const { return metadata_range_->file(); }
 
   virtual Status GetNextInternal(RowBatch* row_batch) WARN_UNUSED_RESULT;
+
+  /// Struct to store context information needed to evaluate Parquet statistics.
+  struct ColumnStatsContext {
+    /// Tuple to store values for predicate evaluation based on Parquet statistics. Must
+    /// not be nullptr.
+    Tuple* tuple = nullptr;
+
+    /// Slot descriptor pointing into 'tuple'. May be nullptr.
+    SlotDescriptor* min_desc = nullptr;
+
+    /// Constraint on the minimum statistics value. May be nullptr if min_desc is nullptr.
+    ScalarExprEvaluator* min_eval = nullptr;
+
+    /// Slot descriptor pointing into 'tuple'. May be nullptr.
+    SlotDescriptor* max_desc = nullptr;
+
+    /// Constraint on the maximum statistics value. May be nullptr if max_desc is nullptr.
+    ScalarExprEvaluator* max_eval = nullptr;
+
+    /// Stores the pointer to the ColumnOrder of the column. See parquet.thrift for more
+    /// information. May be nullptr.
+    const parquet::ColumnOrder* col_order = nullptr;
+  };
+
+  /// Map to store the ColumnStatsContext objects for columns.
+  typedef std::unordered_map<int, ColumnStatsContext> ColumnStatsContextMap;
+  ColumnStatsContextMap column_stats_contexts_;
+
+  /// Initialize the ColumnStatsContexts for all columns in 'min_max_conjunct_evals_'.
+  /// 'skip_row_group' must not be nullptr and will indicate whether the whole file can be
+  /// skipped based on statistics.
+  Status BuildColumnStatsContexts(const parquet::FileMetaData& file_metadata);
 
   /// Evaluates the min/max predicates of the 'scan_node_' using the parquet::Statistics
   /// of 'row_group'. 'file_metadata' is used to determine the ordering that was used to

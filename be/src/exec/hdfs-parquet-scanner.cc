@@ -160,6 +160,7 @@ HdfsParquetScanner::HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState
     row_group_rows_read_(0),
     advance_row_group_(true),
     min_max_tuple_buffer_(scan_node->mem_tracker()),
+    skip_file_on_stats_(false),
     row_batches_produced_(0),
     scratch_batch_(new ScratchTupleBatch(
         *scan_node->row_desc(), state_->batch_size(), scan_node->mem_tracker())),
@@ -188,6 +189,9 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
           TUnit::UNIT);
   num_row_groups_counter_ =
       ADD_COUNTER(scan_node_->runtime_profile(), "NumRowGroups", TUnit::UNIT);
+  num_stats_filtered_pages_counter_ =
+      ADD_COUNTER(scan_node_->runtime_profile(), "NumStatsFilteredPages",
+          TUnit::UNIT);
   num_scanners_with_no_reads_counter_ =
       ADD_COUNTER(scan_node_->runtime_profile(), "NumScannersWithNoReads", TUnit::UNIT);
   num_dict_filtered_row_groups_counter_ =
@@ -252,6 +256,11 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
       state_->query_options().parquet_array_resolution));
   RETURN_IF_ERROR(schema_resolver_->Init(&file_metadata_, filename()));
 
+  // Build stats contexts.
+  RETURN_IF_ERROR(BuildColumnStatsContexts(file_metadata_));
+  // TODO: For some cases we are able to skip the whole file after this call, for example
+  // when hitting a missing field. How can this be done in Open()?
+
   // We've processed the metadata and there are columns that need to be materialized.
   RETURN_IF_ERROR(CreateColumnReaders(
       *scan_node_->tuple_desc(), *schema_resolver_, &column_readers_));
@@ -259,6 +268,15 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
       static_cast<int64_t>(CountScalarColumns(column_readers_)));
   // Set top-level template tuple.
   template_tuple_ = template_tuple_map_[scan_node_->tuple_desc()];
+
+  // Distribute column readers between constrained and non-constrained lists.
+  for (ParquetColumnReader* col_reader: column_readers_) {
+    if (col_reader->IsStatsContrained()) {
+      stats_constrained_readers_.push_back(col_reader);
+    } else {
+      non_stats_constrained_readers_.push_back(col_reader);
+    }
+  }
 
   RETURN_IF_ERROR(InitDictFilterStructures());
 
@@ -524,13 +542,8 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
   return Status::OK();
 }
 
-Status HdfsParquetScanner::EvaluateStatsConjuncts(
-    const parquet::FileMetaData& file_metadata, const parquet::RowGroup& row_group,
-    bool* skip_row_group) {
-  *skip_row_group = false;
-
-  if (!state_->query_options().parquet_read_statistics) return Status::OK();
-
+Status HdfsParquetScanner::BuildColumnStatsContexts(
+    const parquet::FileMetaData& file_metadata) {
   const TupleDescriptor* min_max_tuple_desc = scan_node_->min_max_tuple_desc();
   if (!min_max_tuple_desc) return Status::OK();
 
@@ -556,7 +569,7 @@ Status HdfsParquetScanner::EvaluateStatsConjuncts(
       // during the scan, so any predicate would evaluate to false. Return early. NULL
       // comparisons cannot happen here, since predicates with NULL literals are filtered
       // in the frontend.
-      *skip_row_group = true;
+      skip_file_on_stats_ = true;
       return Status::OK();
     }
 
@@ -570,33 +583,75 @@ Status HdfsParquetScanner::EvaluateStatsConjuncts(
     }
 
     int col_idx = node->col_idx;
-    DCHECK_LT(col_idx, row_group.columns.size());
+
+    ColumnStatsContext& col_stats_ctx = column_stats_contexts_[col_idx];
 
     const vector<parquet::ColumnOrder>& col_orders = file_metadata.column_orders;
-    const parquet::ColumnOrder* col_order = nullptr;
-    if (col_idx < col_orders.size()) col_order = &col_orders[col_idx];
+    if (col_idx < col_orders.size()) col_stats_ctx.col_order = &col_orders[col_idx];
 
-    const parquet::ColumnChunk& col_chunk = row_group.columns[col_idx];
-    const ColumnType& col_type = slot_desc->type();
-    bool stats_read = false;
-    void* slot = min_max_tuple->GetSlot(slot_desc->tuple_offset());
     const string& fn_name = eval->root().function_name();
     if (fn_name == "lt" || fn_name == "le") {
       // We need to get min stats.
-      stats_read = ColumnStatsBase::ReadFromThrift(
-          col_chunk, col_type, col_order, ColumnStatsBase::StatsField::MIN, slot);
+      col_stats_ctx.min_desc = slot_desc;
+      col_stats_ctx.min_eval = eval;
     } else if (fn_name == "gt" || fn_name == "ge") {
       // We need to get max stats.
-      stats_read = ColumnStatsBase::ReadFromThrift(
-          col_chunk, col_type, col_order, ColumnStatsBase::StatsField::MAX, slot);
+      col_stats_ctx.max_desc = slot_desc;
+      col_stats_ctx.max_eval = eval;
     } else {
       DCHECK(false) << "Unsupported function name for statistics evaluation: " << fn_name;
     }
+    col_stats_ctx.tuple = min_max_tuple;
+  }
+  return Status::OK();
+}
 
-    if (stats_read) {
+Status HdfsParquetScanner::EvaluateStatsConjuncts(
+    const parquet::FileMetaData& file_metadata, const parquet::RowGroup& row_group,
+    bool* skip_row_group) {
+  *skip_row_group = false;
+
+  if (!state_->query_options().parquet_read_statistics) return Status::OK();
+
+  if (column_stats_contexts_.empty()) return Status::OK();
+
+  for (auto it : column_stats_contexts_) {
+    int col_idx = it.first;
+    DCHECK(col_idx < row_group.columns.size());
+    ColumnStatsContext& col_stats_ctx = it.second;
+
+    const parquet::ColumnChunk& col_chunk = row_group.columns[col_idx];
+    if (!(col_chunk.__isset.meta_data && col_chunk.meta_data.__isset.statistics)) {
+      continue;
+    }
+    const parquet::Statistics& stats = col_chunk.meta_data.statistics;
+
+    ScalarExprEvaluator* evals[2];
+    int num_evals = 0;
+
+    if (col_stats_ctx.min_desc != nullptr) {
+      void* slot = col_stats_ctx.tuple->GetSlot(col_stats_ctx.min_desc->tuple_offset());
+      DCHECK(col_stats_ctx.min_eval != nullptr);
+      if (ColumnStatsBase::ReadFromThrift(stats, col_stats_ctx.min_desc->type(),
+            col_stats_ctx.col_order, ColumnStatsBase::StatsField::MIN, slot)) {
+        evals[num_evals++] = col_stats_ctx.min_eval;
+      }
+    }
+
+    if (col_stats_ctx.max_desc != nullptr) {
+      void* slot = col_stats_ctx.tuple->GetSlot(col_stats_ctx.max_desc->tuple_offset());
+      DCHECK(col_stats_ctx.max_eval != nullptr);
+      if (ColumnStatsBase::ReadFromThrift(stats, col_stats_ctx.max_desc->type(),
+            col_stats_ctx.col_order, ColumnStatsBase::StatsField::MAX, slot)) {
+        evals[num_evals++] = col_stats_ctx.max_eval;
+      }
+    }
+
+    if (num_evals > 0) {
       TupleRow row;
-      row.SetTuple(0, min_max_tuple);
-      if (!ExecNode::EvalPredicate(eval, &row)) {
+      DCHECK(col_stats_ctx.tuple != nullptr);
+      row.SetTuple(0, col_stats_ctx.tuple);
+      if (!ExecNode::EvalConjuncts(evals, num_evals, &row)) {
         *skip_row_group = true;
         return Status::OK();
       }
@@ -660,9 +715,12 @@ Status HdfsParquetScanner::NextRowGroup() {
     COUNTER_ADD(num_row_groups_counter_, 1);
 
     // Evaluate row group statistics.
-    bool skip_row_group_on_stats;
-    RETURN_IF_ERROR(
-        EvaluateStatsConjuncts(file_metadata_, row_group, &skip_row_group_on_stats));
+    bool skip_row_group_on_stats = skip_file_on_stats_;
+    if (!skip_row_group_on_stats) {
+      RETURN_IF_ERROR(
+          EvaluateStatsConjuncts(file_metadata_, row_group, &skip_row_group_on_stats));
+    }
+
     if (skip_row_group_on_stats) {
       COUNTER_ADD(num_stats_filtered_row_groups_counter_, 1);
       continue;
@@ -959,24 +1017,135 @@ Status HdfsParquetScanner::AssembleRows(
   DCHECK_EQ(*skip_row_group, false);
   DCHECK(scratch_batch_ != NULL);
 
+  int64_t min_num_rows_left_in_page = 0;
+  int64_t min_num_rows_left_reader_idx = 0;
+
   while (!column_readers[0]->RowGroupAtEnd()) {
     // Start a new scratch batch.
     RETURN_IF_ERROR(scratch_batch_->Reset(state_));
     InitTupleBuffer(template_tuple_, scratch_batch_->tuple_mem, scratch_batch_->capacity);
 
+    bool continue_execution = true;
+
+    DCHECK(!column_readers_.empty());
+    // Verify that all readers are in sync.
+    int64_t current_row = column_readers_[0]->NextValueToRead();
+    for (ParquetColumnReader* c : column_readers_) {
+      DCHECK_EQ(c->NextValueToRead(), current_row);
+    }
+
+    // If no more rows are remaining, one of the constrained readers must be at the end of
+    // a page. Invoke the page skipping logic.
+    int64_t skip_to_row = current_row;
+    if (min_num_rows_left_in_page == 0) {
+
+      min_num_rows_left_in_page = std::numeric_limits<int64_t>::max();
+
+      int64_t cur_idx = min_num_rows_left_reader_idx;
+      // num_ready_readers tracks the number or readers that have skipped forward to the
+      // target row. It gets reset if a reader skips more rows.
+      for (int num_ready_readers = 0;
+          num_ready_readers < stats_constrained_readers_.size(); ++num_ready_readers) {
+        if (cur_idx == stats_constrained_readers_.size()) cur_idx = 0;
+
+        ParquetColumnReader* col_reader = stats_constrained_readers_[cur_idx];
+        int64_t num_remaining_in_page = 0;
+        int64_t skipped_to_row = 0;
+        continue_execution = col_reader->SkipToValue(skip_to_row, &skipped_to_row,
+            &num_remaining_in_page);
+
+        DCHECK(!continue_execution || num_remaining_in_page > 0);
+
+        if (skipped_to_row > skip_to_row) {
+          skip_to_row = skipped_to_row;
+          // We skipped some data, reset the counter of ready readers.
+          num_ready_readers = 0;
+        }
+        if (num_remaining_in_page < min_num_rows_left_in_page) {
+          min_num_rows_left_in_page = num_remaining_in_page;
+          min_num_rows_left_reader_idx = cur_idx;
+        }
+        bool num_tuples_mismatch = skipped_to_row < skip_to_row;
+        // TODO Fix code duplication here and in the loops below
+        if (UNLIKELY(!continue_execution || num_tuples_mismatch)) {
+          // Skipping this row group. Free up all the resources with this row group.
+          FlushRowGroupResources(row_batch);
+          scratch_batch_->num_tuples = 0;
+          DCHECK(scratch_batch_->AtEnd());
+          *skip_row_group = true;
+          if (num_tuples_mismatch && continue_execution) {
+            parse_status_.MergeStatus(Status(Substitute("Corrupt Parquet file '$0': "
+                  "column '$1' had $2 remaining values but expected $3 more", filename(),
+                  col_reader->schema_element().name, skip_to_row - skipped_to_row,
+                  scratch_batch_->num_tuples)));
+          }
+          return Status::OK();
+        }
+        ++cur_idx;
+      }
+      DCHECK(stats_constrained_readers_.empty() ||
+          min_num_rows_left_in_page < std::numeric_limits<int64_t>::max());
+      DCHECK(min_num_rows_left_in_page > 0);
+    }
+
+    // Verify that all constrained readers have skipped to the same row.
+    for (ParquetColumnReader* c : stats_constrained_readers_) {
+      DCHECK_EQ(c->NextValueToRead(), skip_to_row);
+    }
+
+    // Verify that all non-constrained readers have not skipped yet.
+    for (ParquetColumnReader* c : non_stats_constrained_readers_) {
+      DCHECK_EQ(c->NextValueToRead(), current_row);
+    }
+
+    if (skip_to_row > current_row) {
+      // Loop over all non-constrained readers and skip forward to the new start row.
+      // Every non-constrained reader is expected to skip successfully to the target row.
+      for (ParquetColumnReader* col_reader : non_stats_constrained_readers_) {
+        int64_t skipped_to_row = 0;
+        // Collection readers will return 'num_remaining_in_page' > 0.
+        int64_t num_remaining_in_page = 0;
+        continue_execution = col_reader->SkipToValue(skip_to_row, &skipped_to_row,
+            &num_remaining_in_page);
+        DCHECK(!continue_execution || num_remaining_in_page > 0);
+        bool num_tuples_mismatch = skipped_to_row < skip_to_row;
+        if (UNLIKELY(!continue_execution || num_tuples_mismatch)) {
+          // Skipping this row group. Free up all the resources with this row group.
+          FlushRowGroupResources(row_batch);
+          scratch_batch_->num_tuples = 0;
+          DCHECK(scratch_batch_->AtEnd());
+          *skip_row_group = true;
+          if (num_tuples_mismatch && continue_execution) {
+            parse_status_.MergeStatus(Status(Substitute("Corrupt Parquet file '$0': "
+                  "column '$1' had $2 remaining values but expected $3 more", filename(),
+                  col_reader->schema_element().name, skip_to_row - skipped_to_row,
+                  scratch_batch_->num_tuples)));
+          }
+          return Status::OK();
+        }
+      }
+    }
+
+    // Verify that all readers have skipped to the same row.
+    for (ParquetColumnReader* c : column_readers_) {
+      DCHECK_EQ(c->NextValueToRead(), skip_to_row);
+    }
+
+    int64_t scratch_capacity = scratch_batch_->capacity;
+    int64_t num_rows_to_read = min(min_num_rows_left_in_page, scratch_capacity);
+
     // Materialize the top-level slots into the scratch batch column-by-column.
     int last_num_tuples = -1;
-    int num_col_readers = column_readers.size();
-    bool continue_execution = true;
+    int num_col_readers = column_readers_.size();
     for (int c = 0; c < num_col_readers; ++c) {
       ParquetColumnReader* col_reader = column_readers[c];
       if (col_reader->max_rep_level() > 0) {
         continue_execution = col_reader->ReadValueBatch(&scratch_batch_->aux_mem_pool,
-            scratch_batch_->capacity, tuple_byte_size_, scratch_batch_->tuple_mem,
+            num_rows_to_read, tuple_byte_size_, scratch_batch_->tuple_mem,
             &scratch_batch_->num_tuples);
       } else {
         continue_execution = col_reader->ReadNonRepeatedValueBatch(
-            &scratch_batch_->aux_mem_pool, scratch_batch_->capacity, tuple_byte_size_,
+            &scratch_batch_->aux_mem_pool, num_rows_to_read, tuple_byte_size_,
             scratch_batch_->tuple_mem, &scratch_batch_->num_tuples);
       }
       // Check that all column readers populated the same number of values.
@@ -998,7 +1167,9 @@ Status HdfsParquetScanner::AssembleRows(
       }
       last_num_tuples = scratch_batch_->num_tuples;
     }
+
     row_group_rows_read_ += scratch_batch_->num_tuples;
+    min_num_rows_left_in_page -= scratch_batch_->num_tuples;
     COUNTER_ADD(scan_node_->rows_read_counter(), scratch_batch_->num_tuples);
 
     int num_row_to_commit = TransferScratchTuples(row_batch);
@@ -1490,8 +1661,12 @@ Status HdfsParquetScanner::CreateColumnReaders(const TupleDescriptor& tuple_desc
       continue;
     }
 
+    ColumnStatsContext* col_stats_ctx = nullptr;
+    auto it = column_stats_contexts_.find(node->col_idx);
+    if (it != column_stats_contexts_.end()) col_stats_ctx = &it->second;
+
     ParquetColumnReader* col_reader = ParquetColumnReader::Create(
-        *node, slot_desc->type().IsCollectionType(), slot_desc, this);
+        *node, slot_desc->type().IsCollectionType(), slot_desc, this, col_stats_ctx);
     column_readers->push_back(col_reader);
 
     if (col_reader->IsCollectionReader()) {
@@ -1550,7 +1725,7 @@ Status HdfsParquetScanner::CreateCountingReader(const SchemaPath& parent_path,
     }
 
     *reader = ParquetColumnReader::Create(
-        *target_node, target_node->is_repeated(), NULL, this);
+        *target_node, target_node->is_repeated(), NULL, this, nullptr);
     if (target_node->is_repeated()) {
       // Find the closest scalar descendent of 'target_node' via breadth-first search, and
       // create scalar reader to drive 'reader'. We find the closest (i.e. least-nested)
@@ -1574,12 +1749,12 @@ Status HdfsParquetScanner::CreateCountingReader(const SchemaPath& parent_path,
       CollectionColumnReader* parent_reader =
           static_cast<CollectionColumnReader*>(*reader);
       parent_reader->children()->push_back(
-          ParquetColumnReader::Create(*node, false, NULL, this));
+          ParquetColumnReader::Create(*node, false, NULL, this, nullptr));
     }
   } else {
     // Special case for a repeated scalar node. The repeated node represents both the
     // parent collection and the child item.
-    *reader = ParquetColumnReader::Create(*parent_node, false, NULL, this);
+    *reader = ParquetColumnReader::Create(*parent_node, false, NULL, this, nullptr);
   }
 
   return Status::OK();
@@ -1722,12 +1897,13 @@ Status HdfsParquetScanner::ValidateEndOfRowGroup(
   DCHECK(parse_status_.ok()) << "Don't overwrite parse_status_"
       << parse_status_.GetDetail();
 
+  // TODO: Should we refine this by counting the number of skipped rows?
   if (column_readers[0]->max_rep_level() == 0) {
     // These column readers materialize table-level values (vs. collection values). Test
     // if the expected number of rows from the file metadata matches the actual number of
     // rows read from the file.
     int64_t expected_rows_in_group = file_metadata_.row_groups[row_group_idx].num_rows;
-    if (rows_read != expected_rows_in_group) {
+    if (rows_read > expected_rows_in_group) {
       return Status(TErrorCode::PARQUET_GROUP_ROW_COUNT_ERROR, filename(), row_group_idx,
           expected_rows_in_group, rows_read);
     }

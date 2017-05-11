@@ -24,14 +24,9 @@
 
 namespace impala {
 
-bool ColumnStatsBase::ReadFromThrift(const parquet::ColumnChunk& col_chunk,
+bool ColumnStatsBase::ReadFromThrift(const parquet::Statistics& stats,
     const ColumnType& col_type, const parquet::ColumnOrder* col_order,
     StatsField stats_field, void* slot) {
-  if (!(col_chunk.__isset.meta_data && col_chunk.meta_data.__isset.statistics)) {
-    return false;
-  }
-  const parquet::Statistics& stats = col_chunk.meta_data.statistics;
-
   // Try to read the requested stats field. If it is not set, we may fall back to reading
   // the old stats, based on the column type.
   const string* stat_value = nullptr;
