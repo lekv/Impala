@@ -205,8 +205,7 @@ class ImpalaShell(object, cmd.Cmd):
       except ImportError:
         self._disable_readline()
 
-    if options.impalad is not None:
-      self.do_connect(options.impalad)
+    self.do_connect(options.impalad)
 
     # We handle Ctrl-C ourselves, using an Event object to signal cancellation
     # requests between the handler and the main shell thread.
@@ -548,9 +547,12 @@ class ImpalaShell(object, cmd.Cmd):
       # If cmdqueue is populated, then commands are executed from the cmdqueue, and user
       # input is ignored. Send an empty string as the user input just to be safe.
       return str()
+    connected = False
     try:
-      self.imp_client.test_connection()
+      connected = self.imp_client.test_connection()
     except TException:
+      connected = False
+    if not connected:
       print_to_stderr("Connection lost, reconnecting...")
       self._connect()
       self._validate_database(immediately=True)
@@ -749,46 +751,6 @@ class ImpalaShell(object, cmd.Cmd):
     if self.imp_client: self.imp_client.close_connection()
     self.imp_client = self._new_impala_client()
     self._connect()
-    # If the connection fails and the Kerberos has not been enabled,
-    # check for a valid kerberos ticket and retry the connection
-    # with kerberos enabled.
-    if not self.imp_client.connected and not self.use_kerberos:
-      try:
-        if call(["klist", "-s"]) == 0:
-          print_to_stderr("Kerberos ticket found in the credentials cache, retrying "
-                          "the connection with a secure transport.")
-          self.use_kerberos = True
-          self.use_ldap = False
-          self.ldap_password = None
-          self.imp_client = self._new_impala_client()
-          self._connect()
-      except OSError, e:
-        pass
-
-    if self.imp_client.connected:
-      self._print_if_verbose('Connected to %s:%s' % self.impalad)
-      self._print_if_verbose('Server version: %s' % self.server_version)
-      self.prompt = "[%s:%s] > " % self.impalad
-      self._validate_database()
-    try:
-      self.imp_client.build_default_query_options_dict()
-    except RPCException, e:
-      print_to_stderr(e)
-    # In the case that we lost connection while a command was being entered,
-    # we may have a dangling command, clear partial_cmd
-    self.partial_cmd = str()
-    # Check if any of query options set by the user are inconsistent
-    # with the impalad being connected to
-
-    # Use a temporary to avoid changing set_query_options during iteration.
-    new_query_options = {}
-    for set_option, value in self.set_query_options.iteritems():
-      if set_option not in set(self.imp_client.default_query_options):
-        print ('%s is not supported for the impalad being '
-               'connected to, ignoring.' % set_option)
-      else:
-        new_query_options[set_option] = value
-    self.set_query_options = new_query_options
 
   def _connect(self):
     try:
@@ -821,6 +783,47 @@ class ImpalaShell(object, cmd.Cmd):
       # reset the prompt to disconnected.
       self.server_version = self.UNKNOWN_SERVER_VERSION
       self.prompt = self.DISCONNECTED_PROMPT
+    # If the connection fails and the Kerberos has not been enabled,
+    # check for a valid kerberos ticket and retry the connection
+    # with kerberos enabled.
+    if not self.imp_client.connected and not self.use_kerberos:
+      try:
+        if call(["klist", "-s"]) == 0:
+          print_to_stderr("Kerberos ticket found in the credentials cache, retrying "
+                          "the connection with a secure transport.")
+          self.use_kerberos = True
+          self.use_ldap = False
+          self.ldap_password = None
+          self.imp_client = self._new_impala_client()
+          # TODO This recursive call is a problem
+          self._connect()
+      except OSError, e:
+        pass
+
+    if self.imp_client.connected:
+      self._print_if_verbose('Connected to %s:%s' % self.impalad)
+      self._print_if_verbose('Server version: %s' % self.server_version)
+      self.prompt = "[%s:%s] > " % self.impalad
+      self._validate_database()
+    try:
+      self.imp_client.build_default_query_options_dict()
+    except RPCException, e:
+      print_to_stderr(e)
+    # In the case that we lost connection while a command was being entered,
+    # we may have a dangling command, clear partial_cmd
+    self.partial_cmd = str()
+    # Check if any of query options set by the user are inconsistent
+    # with the impalad being connected to
+
+    # Use a temporary to avoid changing set_query_options during iteration.
+    new_query_options = {}
+    for set_option, value in self.set_query_options.iteritems():
+      if set_option not in set(self.imp_client.default_query_options):
+        print ('%s is not supported for the impalad being '
+               'connected to, ignoring.' % set_option)
+      else:
+        new_query_options[set_option] = value
+    self.set_query_options = new_query_options
 
   def _reconnect_cancellation(self):
     self._connect()
