@@ -95,9 +95,16 @@ class ImpalaServicePool : public kudu::rpc::RpcService {
   /// Histogram to track time spent by requests in the krpc incoming requests queue.
   scoped_refptr<kudu::Histogram> incoming_queue_time_;
 
-  /// Histogram for incoming request payload size for each method of this service.
-  std::unordered_map<std::string, std::unique_ptr<HistogramMetric>>
-      payload_size_histograms_;
+  /// Histogram metric around incoming_queue_time_, not owned.
+  KrpcHistogramMetric* incoming_queue_time_metric_ = nullptr;
+
+  /// Histogram for incoming request payload size for each method of this service, not
+  /// owned.
+  std::unordered_map<std::string, HistogramMetric*> payload_size_histograms_;
+
+  /// Histogram for incoming request handler latency for each method of this service, not
+  /// owned.
+  std::unordered_map<std::string, KrpcHistogramMetric*> handler_latency_histograms_;
 
   /// Number of RPCs that were rejected due to the queue being full. Not owned.
   IntCounter* rpcs_queue_overflow_= nullptr;

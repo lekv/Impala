@@ -51,7 +51,10 @@ using namespace rapidjson;
 
 namespace impala {
 // Metric key format for rpc call duration metrics.
+const string RPC_HANDLER_LATENCY_METRIC_KEY = "rpc.$0.handler_latency";
+const string RPC_PAYLOAD_SIZE_METRIC_KEY = "rpc.$0.incoming_payload_size";
 const string RPC_QUEUE_OVERFLOW_METRIC_KEY = "rpc.$0.rpcs_queue_overflow";
+const string RPC_QUEUE_TIME_METRIC_KEY = "rpc.$0.incoming_queue_time";
 
 ImpalaServicePool::ImpalaServicePool(const scoped_refptr<kudu::MetricEntity>& entity,
     size_t service_queue_length, kudu::rpc::GeneratedServiceIf* service,
@@ -61,18 +64,39 @@ ImpalaServicePool::ImpalaServicePool(const scoped_refptr<kudu::MetricEntity>& en
     service_queue_(service_queue_length),
     incoming_queue_time_(METRIC_impala_incoming_queue_time.Instantiate(entity)) {
   DCHECK(service_mem_tracker_ != nullptr);
+  const string& service_name = service_->service_name();
+
+  // Register metric for queue overflow count
   const TMetricDef& overflow_metric_def =
-      MetricDefs::Get(RPC_QUEUE_OVERFLOW_METRIC_KEY, service_->service_name());
+      MetricDefs::Get(RPC_QUEUE_OVERFLOW_METRIC_KEY, service_name);
   rpcs_queue_overflow_ = ExecEnv::GetInstance()->rpc_metrics()->RegisterMetric(
       new IntCounter(overflow_metric_def, 0L));
+
+  // Register metric for incoming queue time histogram
+  const TMetricDef& queue_time_metric_def =
+      MetricDefs::Get(RPC_QUEUE_TIME_METRIC_KEY, service_name);
+  incoming_queue_time_metric_ = ExecEnv::GetInstance()->rpc_metrics()->RegisterMetric(
+      new KrpcHistogramMetric(queue_time_metric_def, incoming_queue_time_.get()));
+
   // Initialize additional histograms for each method of the service.
   // TODO: Retrieve these from KRPC once KUDU-2313 has been implemented.
   for (const auto& method : service_->methods_by_name()) {
-    const string& method_name = method.first;
-    string payload_size_name = Substitute("$0-payload-size", method_name);
-    payload_size_histograms_[method_name].reset(new HistogramMetric(
-        MakeTMetricDef(method_name, TMetricKind::HISTOGRAM, TUnit::BYTES),
-        1024 * 1024 * 1024, 3));
+    // Register metric for payload size histogram
+    const string& method_name = Substitute("$0.$1", service_name, method.first);
+    const TMetricDef& payload_metric_def =
+        MetricDefs::Get(RPC_PAYLOAD_SIZE_METRIC_KEY, method_name);
+    payload_size_histograms_[method.first] =
+        ExecEnv::GetInstance()->rpc_metrics()->RegisterMetric(
+        new HistogramMetric(payload_metric_def, 1024 * 1024 * 1024, 3));
+
+    // Register metric for handler latency histogram
+    kudu::rpc::RpcMethodInfo* method_info = method.second.get();
+    kudu::Histogram* handler_latency = method_info->handler_latency_histogram.get();
+    const TMetricDef& handler_latency_metric_def =
+        MetricDefs::Get(RPC_HANDLER_LATENCY_METRIC_KEY, method_name);
+    handler_latency_histograms_[method.first] =
+        ExecEnv::GetInstance()->rpc_metrics()->RegisterMetric(
+        new KrpcHistogramMetric(handler_latency_metric_def, handler_latency));
   }
 }
 
@@ -278,7 +302,7 @@ void ImpalaServicePool::ToJson(rapidjson::Value* value, rapidjson::Document* doc
       TUnit::BYTES).c_str(), document->GetAllocator());
   value->AddMember("mem_peak", mem_peak, document->GetAllocator());
 
-  Value incoming_queue_time(KrpcHistogramToString(incoming_queue_time_.get()).c_str(),
+  Value incoming_queue_time(incoming_queue_time_metric_->ToHumanReadable().c_str(),
       document->GetAllocator());
   value->AddMember("incoming_queue_time", incoming_queue_time,
       document->GetAllocator());
@@ -294,18 +318,17 @@ void ImpalaServicePool::ToJson(rapidjson::Value* value, rapidjson::Document* doc
     Value method_name_val(method_name.c_str(), document->GetAllocator());
     method_entry.AddMember("method_name", method_name_val, document->GetAllocator());
 
-    kudu::rpc::RpcMethodInfo* method_info = method.second.get();
-    kudu::Histogram* handler_latency = method_info->handler_latency_histogram.get();
-    Value handler_latency_val(KrpcHistogramToString(handler_latency).c_str(),
-        document->GetAllocator());
+    HistogramMetric* payload_size = payload_size_histograms_[method_name];
+    DCHECK(payload_size != nullptr);
+    Value payload_size_val(kObjectType);
+    payload_size->ToJson(document, &payload_size_val);
+    method_entry.AddMember("payload_size", payload_size_val, document->GetAllocator());
+
+    KrpcHistogramMetric* handler_latency = handler_latency_histograms_[method_name];
+    Value handler_latency_val(kObjectType);
+    handler_latency->ToJson(document, &handler_latency_val);
     method_entry.AddMember("handler_latency", handler_latency_val,
         document->GetAllocator());
-
-    HistogramMetric* payload_size = payload_size_histograms_[method_name].get();
-    DCHECK(payload_size != nullptr);
-    Value payload_size_val(payload_size->ToHumanReadable().c_str(),
-        document->GetAllocator());
-    method_entry.AddMember("payload_size", payload_size_val, document->GetAllocator());
 
     rpc_method_metrics.PushBack(method_entry, document->GetAllocator());
   }

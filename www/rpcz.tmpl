@@ -72,11 +72,12 @@ under the License.
         </td></tr>
         <tr>
           <td>Handler Latency</td>
-          <td class="{{method_name}}_handler_latency">{{handler_latency}}</td>
+          <td class="{{method_name}}_handler_latency">{{handler_latency.human_readable}}
+          </td>
         </tr>
         <tr>
           <td>Payload Size</td>
-          <td class="{{method_name}}_payload_size">{{payload_size}}</td>
+          <td class="{{method_name}}_payload_size">{{payload_size.human_readable}}</td>
         </tr>
       </table>
     {{/rpc_method_metrics}}
@@ -219,7 +220,7 @@ function update_krpc_services(json) {
         var cell = $(table).find("." + method_name + "_" + key)[0];
         // Skip update for unknown values.
         if (!cell) continue;
-        cell.innerHTML = method_json[key];
+        cell.innerHTML = method_json[key]["human_readable"];
       }
     }
   }

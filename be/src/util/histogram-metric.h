@@ -18,6 +18,8 @@
 #ifndef IMPALA_UTIL_HISTOGRAM_METRIC
 #define IMPALA_UTIL_HISTOGRAM_METRIC
 
+#include "kudu/util/hdr_histogram.h"
+#include "kudu/util/metrics.h"
 #include "util/hdr-histogram.h"
 #include "util/metrics.h"
 #include "util/spinlock.h"
@@ -40,35 +42,9 @@ class HistogramMetric : public Metric {
   }
 
   virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) override {
-    rapidjson::Value container(rapidjson::kObjectType);
-    AddStandardFields(document, &container);
-
-    {
-      boost::lock_guard<SpinLock> l(lock_);
-
-      container.AddMember(
-          "25th %-ile", histogram_->ValueAtPercentile(25), document->GetAllocator());
-      container.AddMember(
-          "50th %-ile", histogram_->ValueAtPercentile(50), document->GetAllocator());
-      container.AddMember(
-          "75th %-ile", histogram_->ValueAtPercentile(75), document->GetAllocator());
-      container.AddMember(
-          "90th %-ile", histogram_->ValueAtPercentile(90), document->GetAllocator());
-      container.AddMember(
-          "95th %-ile", histogram_->ValueAtPercentile(95), document->GetAllocator());
-      container.AddMember(
-          "99.9th %-ile", histogram_->ValueAtPercentile(99.9), document->GetAllocator());
-      container.AddMember("max", histogram_->MaxValue(), document->GetAllocator());
-      container.AddMember("min", histogram_->MinValue(), document->GetAllocator());
-      container.AddMember("count", histogram_->TotalCount(), document->GetAllocator());
-    }
-    rapidjson::Value type_value(PrintTMetricKind(TMetricKind::HISTOGRAM).c_str(),
-        document->GetAllocator());
-    container.AddMember("kind", type_value, document->GetAllocator());
-    rapidjson::Value units(PrintTUnit(unit()).c_str(), document->GetAllocator());
-    container.AddMember("units", units, document->GetAllocator());
-
-    *value = container;
+    AddStandardFields(document, value);
+    boost::lock_guard<SpinLock> l(lock_);
+    HistogramToJson(histogram_.get(), unit(), document, value);
   }
 
   void Update(int64_t val) {
@@ -118,6 +94,31 @@ class HistogramMetric : public Metric {
     return out.str();
   }
 
+  template <class T>
+  static void HistogramToJson(T* histogram, TUnit::type unit,
+      rapidjson::Document* document, rapidjson::Value* value) {
+    value->AddMember(
+        "25th %-ile", histogram->ValueAtPercentile(25), document->GetAllocator());
+    value->AddMember(
+        "50th %-ile", histogram->ValueAtPercentile(50), document->GetAllocator());
+    value->AddMember(
+        "75th %-ile", histogram->ValueAtPercentile(75), document->GetAllocator());
+    value->AddMember(
+        "90th %-ile", histogram->ValueAtPercentile(90), document->GetAllocator());
+    value->AddMember(
+        "95th %-ile", histogram->ValueAtPercentile(95), document->GetAllocator());
+    value->AddMember(
+        "99.9th %-ile", histogram->ValueAtPercentile(99.9), document->GetAllocator());
+    value->AddMember("max", histogram->MaxValue(), document->GetAllocator());
+    value->AddMember("min", histogram->MinValue(), document->GetAllocator());
+    value->AddMember("count", histogram->TotalCount(), document->GetAllocator());
+    rapidjson::Value type_value(PrintTMetricKind(TMetricKind::HISTOGRAM).c_str(),
+        document->GetAllocator());
+    value->AddMember("kind", type_value, document->GetAllocator());
+    rapidjson::Value units(PrintTUnit(unit).c_str(), document->GetAllocator());
+    value->AddMember("units", units, document->GetAllocator());
+  }
+
  private:
   /// Protects histogram_ pointer itself.
   SpinLock lock_;
@@ -125,6 +126,34 @@ class HistogramMetric : public Metric {
   const TUnit::type unit_;
 
   DISALLOW_COPY_AND_ASSIGN(HistogramMetric);
+};
+
+class KrpcHistogramMetric : public Metric {
+ public:
+  KrpcHistogramMetric(const TMetricDef& def, kudu::Histogram* histogram)
+    : Metric(def),
+      histogram_(histogram),
+      unit_(def.units) {
+    DCHECK(histogram != nullptr);
+    DCHECK_EQ(TMetricKind::HISTOGRAM, def.kind);
+  }
+
+  virtual std::string ToHumanReadable() override {
+    kudu::HdrHistogram snapshot(*histogram_->histogram());
+    return HistogramMetric::HistogramToHumanReadable(&snapshot, unit_);
+  }
+
+  virtual void ToJson(rapidjson::Document* document, rapidjson::Value* value) override {
+    AddStandardFields(document, value);
+    kudu::HdrHistogram snapshot(*histogram_->histogram());
+    HistogramMetric::HistogramToJson(&snapshot, unit_, document, value);
+  }
+
+  virtual void ToLegacyJson(rapidjson::Document*) override {}
+ private:
+  kudu::Histogram* histogram_ = nullptr;
+  const TUnit::type unit_;
+  DISALLOW_COPY_AND_ASSIGN(KrpcHistogramMetric);
 };
 
 }

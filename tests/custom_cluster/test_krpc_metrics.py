@@ -48,19 +48,22 @@ class TestKrpcMetrics(CustomClusterTestSuite):
     assert response.status_code == requests.codes.ok
     return json.loads(response.text)
 
+  def get_service_json(self, name):
+    rpcz = self.get_debug_page(self.RPCZ_URL)
+    assert len(rpcz['services']) > 0
+    for s in rpcz['services']:
+      if s['service_name'] == name:
+        return s
+    assert False, 'Could not find metrics for service %s' % name
+
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args('-datastream_service_queue_mem_limit=1B \
                                      -datastream_service_num_svc_threads=1')
   def test_krpc_queue_overflow_rpcz(self, vector):
-    """Test that rejected RPCs show up on the /rpcz debug web page.
-    """
+    """Test that rejected RPCs show up on the /rpcz debug web page."""
     def get_rpc_overflows():
-      rpcz = self.get_debug_page(self.RPCZ_URL)
-      assert len(rpcz['services']) > 0
-      for s in rpcz['services']:
-        if s['service_name'] == 'impala.DataStreamService':
-          return int(s['rpcs_queue_overflow'])
-      assert False, "Could not find DataStreamService metrics"
+      s = self.get_service_json('impala.DataStreamService')
+      return int(s['rpcs_queue_overflow'])
 
     before = get_rpc_overflows()
     assert before == 0
@@ -69,20 +72,53 @@ class TestKrpcMetrics(CustomClusterTestSuite):
 
     assert before < after
 
+  def test_krpc_histograms(self, vector):
+    """Test that the KRPC histograms on /rpcz are structured json."""
+    self.client.execute(self.TEST_QUERY)
+    s = self.get_service_json('impala.DataStreamService')
+    def get_method_metrics(name):
+      for m in s['rpc_method_metrics']:
+        if m['method_name'] == name:
+          return m
+      assert False, 'Could not find metrics for method %s' % name
+
+    for method in ['EndDataStream', 'TransmitData']:
+      method_metrics = get_method_metrics(method)
+      for histogram in ['handler_latency', 'handler_latency']:
+        assert int(method_metrics[histogram]['count']) > 0
+
+  def iter_metrics(self, group = None):
+    group = group or self.get_debug_page(self.METRICS_URL)['metric_group']
+    for m in group['metrics']:
+      yield m
+    for c in group['child_groups']:
+      for m in self.iter_metrics(c):
+        yield m
+
   def get_metric(self, name):
     """Finds the metric with name 'name' and returns its value as an int."""
-    def iter_metrics(group):
-      for m in group['metrics']:
-        yield m
-      for c in group['child_groups']:
-        for m in iter_metrics(c):
-          yield m
-
-    metrics = self.get_debug_page(self.METRICS_URL)['metric_group']
-    for m in iter_metrics(metrics):
+    for m in self.iter_metrics():
       if m['name'] == name:
-        return int(m['value'])
+        return m
     assert False, "Could not find metric: %s" % name
+
+  def get_counter(self, name):
+    """Returns the value of the COUNTER metric 'name' as an int."""
+    m = self.get_metric(name)
+    assert m['kind'] == 'COUNTER', "Metric is of wrong type: %s" % m['kind']
+    return int(m['value'])
+
+  def get_gauge(self, name):
+    """Returns the value of the GAUGE metric 'name' as an int."""
+    m = self.get_metric(name)
+    assert m['kind'] == 'GAUGE', "Metric is of wrong type: %s" % m['kind']
+    return int(m['value'])
+
+  def get_histogram_metric(self, name):
+    """Returns the HISTOGRAM metric 'name' as a dict."""
+    m = self.get_metric(name)
+    assert m['kind'] == 'HISTOGRAM', "Metric is of wrong type: %s" % m['kind']
+    return m
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args('-datastream_service_queue_mem_limit=1B \
@@ -91,18 +127,31 @@ class TestKrpcMetrics(CustomClusterTestSuite):
     """Test that rejected RPCs show up on the /metrics debug web page.
     """
     metric_name = 'rpc.impala.DataStreamService.rpcs_queue_overflow'
-    before = self.get_metric(metric_name)
+    before = self.get_counter(metric_name)
     assert before == 0
 
     self.client.execute(self.TEST_QUERY)
-    after = self.get_metric(metric_name)
+    after = self.get_counter(metric_name)
     assert before < after
 
   @pytest.mark.execute_serially
-  def test_krpc_service_queue_metrics(self, vector):
-    """Test that memory usage metrics for the data stream service queue show up on the
-    /metrics debug web page.
+  def test_krpc_service_metrics(self, vector):
+    """Test that KRPC metrics show up on the /metrics debug web page.
     """
     self.client.execute(self.TEST_QUERY)
-    assert self.get_metric('mem-tracker.DataStreamService.current_usage_bytes') >= 0
-    assert self.get_metric('mem-tracker.DataStreamService.peak_usage_bytes') > 0
+    assert self.get_gauge('mem-tracker.DataStreamService.current_usage_bytes') >= 0
+    assert self.get_gauge('mem-tracker.DataStreamService.peak_usage_bytes') > 0
+
+    histogram_names = ['rpc.impala.DataStreamService.EndDataStream.handler_latency',
+                       'rpc.impala.DataStreamService.EndDataStream.incoming_payload_size',
+                       'rpc.impala.DataStreamService.TransmitData.handler_latency',
+                       'rpc.impala.DataStreamService.TransmitData.incoming_payload_size',
+                       'rpc.impala.DataStreamService.incoming_queue_time']
+
+    for name in histogram_names:
+      m = self.get_histogram_metric(name)
+      assert int(m['count']) > 0
+      assert int(m['99.9th %-ile']) >= int(m['25th %-ile']) >= 0
+      assert m['units'] in ['BYTES', 'TIME_US']
+
+

@@ -173,7 +173,7 @@ void MetricGroup::TemplateCallback(const Webserver::ArgumentMap& args,
 void MetricGroup::ToJson(bool include_children, Document* document, Value* out_val) {
   Value metric_list(kArrayType);
   for (const MetricMap::value_type& m: metric_map_) {
-    Value metric_value;
+    Value metric_value(kObjectType);
     m.second->ToJson(document, &metric_value);
     metric_list.PushBack(metric_value, document->GetAllocator());
   }

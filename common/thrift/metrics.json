@@ -1657,6 +1657,36 @@
     "key": "rpc.$0.rpcs_queue_overflow"
   },
   {
+    "description": "Service $0: RPC Incoming Queue Time",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Service $0 RPC Incoming Queue Time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "rpc.$0.incoming_queue_time"
+  },
+  {
+    "description": "Endpoint $0 RPC Incoming Payload Size",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Endpoint $0 RPC Incoming Payload Size",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "rpc.$0.incoming_payload_size"
+  },
+  {
+    "description": "Endpoint $0: RPC Handler Latency",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Endpoint $0 RPC Handler Latency",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "rpc.$0.handler_latency"
+  },
+  {
     "description": "Memtracker $0 Current Usage Bytes",
     "contexts": [
       "IMPALAD"
